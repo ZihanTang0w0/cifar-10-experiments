@@ -7,6 +7,7 @@ from scipy import linalg
 import pickle
 import argparse
 import os
+import time
 from tqdm import tqdm
 
 # ==========================================
@@ -39,7 +40,10 @@ class InceptionV3FeatureExtractor(nn.Module):
 # 2. FID Math Helper
 # ==========================================
 def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
-    """Numpy implementation of the Frechet Distance."""
+    """
+    Numpy implementation of the Frechet Distance.
+    Uses eigenvalue decomposition for more stable and efficient computation.
+    """
     mu1 = np.atleast_1d(mu1)
     mu2 = np.atleast_1d(mu2)
     
@@ -53,24 +57,44 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
     diff = mu1 - mu2
 
-    # Product might be almost singular
-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
-    if not np.isfinite(covmean).all():
-        msg = ('fid calculation produces singular product; '
-               'adding %s to diagonal of cov estimates') % eps
-        print(msg)
-        offset = np.eye(sigma1.shape[0]) * eps
-        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+    # Compute sqrt of product using eigenvalue decomposition
+    # This is more numerically stable and faster than direct sqrtm
+    # Compute sigma1^(1/2) using eigenvalue decomposition
+    try:
+        # Compute eigenvalues and eigenvectors of sigma1
+        eigvals1, eigvecs1 = np.linalg.eigh(sigma1)
+        # Clip negative eigenvalues to eps for numerical stability
+        eigvals1 = np.maximum(eigvals1, eps)
+        # Compute sigma1^(1/2)
+        sqrt_sigma1 = eigvecs1 @ np.diag(np.sqrt(eigvals1)) @ eigvecs1.T
+        
+        # Compute sqrt(sigma1^(1/2) @ sigma2 @ sigma1^(1/2))
+        product = sqrt_sigma1 @ sigma2 @ sqrt_sigma1
+        
+        # Compute eigenvalues of the product
+        eigvals_prod, eigvecs_prod = np.linalg.eigh(product)
+        # Clip negative eigenvalues
+        eigvals_prod = np.maximum(eigvals_prod, eps)
+        # Sum of square roots of eigenvalues
+        tr_covmean = np.sum(np.sqrt(eigvals_prod))
+        
+    except np.linalg.LinAlgError:
+        print(f"Warning: Eigenvalue decomposition failed, using fallback method")
+        # Fallback to sqrtm if eigenvalue decomposition fails
+        covmean = linalg.sqrtm(sigma1.dot(sigma2))
+        
+        if not np.isfinite(covmean).all():
+            offset = np.eye(sigma1.shape[0]) * eps
+            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+        
+        if np.iscomplexobj(covmean):
+            if not np.isclose(np.diagonal(covmean).imag, 0, atol=1e-3).all():
+                return np.float64(-1)  # Failure case
+            covmean = covmean.real
+        
+        tr_covmean = np.trace(covmean)
 
-    # Numerical error might give slight imaginary component
-    if np.iscomplexobj(covmean):
-        if not np.isclose(np.diagonal(covmean).imag, 0, atol=1e-3).all():
-            return np.float64(-1) # Failure case
-        covmean = covmean.real
-
-    tr_covmean = np.trace(covmean)
-
-    return (diff.dot(diff) + np.trace(sigma1) +
+    return (diff.dot(diff) + np.trace(sigma1) + 
             np.trace(sigma2) - 2 * tr_covmean)
 
 # ==========================================
@@ -108,7 +132,7 @@ def load_cifar_batch_as_tensor(filepath):
 # ==========================================
 # 4. Feature Extraction & Stats
 # ==========================================
-def get_statistics(images, model, batch_size=50, device='cuda'):
+def get_statistics(images, model, batch_size=50, device='cuda', desc='Processing'):
     """
     Computes mu, sigma for a tensor of images.
     """
@@ -120,7 +144,7 @@ def get_statistics(images, model, batch_size=50, device='cuda'):
     n_batches = (n_samples + batch_size - 1) // batch_size
     
     with torch.no_grad():
-        for i in range(n_batches):
+        for i in tqdm(range(n_batches), desc=desc, leave=False):
             start = i * batch_size
             end = min(start + batch_size, n_samples)
             batch = images[start:end].to(device)
@@ -131,6 +155,7 @@ def get_statistics(images, model, batch_size=50, device='cuda'):
             
     activations = np.concatenate(activations, axis=0) # (N, 2048)
     
+    print(f"Computing covariance matrix for {n_samples} samples...")
     mu = np.mean(activations, axis=0)
     sigma = np.cov(activations, rowvar=False)
     
@@ -145,63 +170,84 @@ def main():
     parser.add_argument("--dataset2", type=str, required=True, help="Path to generated pickle")
     parser.add_argument("--batch_size", type=int, default=50)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--cross_class", action="store_true", help="Calculate cross-class FID (off-diagonal elements)")
     args = parser.parse_args()
+    
+    start_time = time.time()
     
     # 1. Load Model
     print("Loading InceptionV3...")
+    t0 = time.time()
     model = InceptionV3FeatureExtractor().to(args.device)
+    print(f"  Model loaded in {time.time() - t0:.2f}s")
     
     # 2. Load Datasets
     # Returns dict {0: tensor, 1: tensor...} and full tensor
+    t0 = time.time()
     d1_classes, d1_full = load_cifar_batch_as_tensor(args.dataset1)
     d2_classes, d2_full = load_cifar_batch_as_tensor(args.dataset2)
+    print(f"  Datasets loaded in {time.time() - t0:.2f}s")
     
     # 3. Pre-compute Statistics (Optimization)
     # We calculate Mu/Sigma ONCE for every subset to avoid re-running the model
     print("\n--- Computing Statistics for Dataset 1 ---")
+    t0 = time.time()
     stats1_by_class = {}
     for i in tqdm(range(10), desc="Classes D1"):
         if i in d1_classes:
-            stats1_by_class[i] = get_statistics(d1_classes[i], model, args.batch_size, args.device)
+            stats1_by_class[i] = get_statistics(d1_classes[i], model, args.batch_size, args.device, desc=f"D1 Class {i}")
     
     print("Computing stats for D1 Full...")
-    stats1_full = get_statistics(d1_full, model, args.batch_size, args.device)
+    stats1_full = get_statistics(d1_full, model, args.batch_size, args.device, desc="D1 Full Dataset")
+    print(f"  D1 statistics computed in {time.time() - t0:.2f}s")
 
     print("\n--- Computing Statistics for Dataset 2 ---")
+    t0 = time.time()
     stats2_by_class = {}
     for i in tqdm(range(10), desc="Classes D2"):
         if i in d2_classes:
-            stats2_by_class[i] = get_statistics(d2_classes[i], model, args.batch_size, args.device)
+            stats2_by_class[i] = get_statistics(d2_classes[i], model, args.batch_size, args.device, desc=f"D2 Class {i}")
 
     print("Computing stats for D2 Full...")
-    stats2_full = get_statistics(d2_full, model, args.batch_size, args.device)
+    stats2_full = get_statistics(d2_full, model, args.batch_size, args.device, desc="D2 Full Dataset")
+    print(f"  D2 statistics computed in {time.time() - t0:.2f}s")
 
     # =========================================================
     # Task 1 & 2: Class-Wise and Cross-Class Matrix
     # =========================================================
     print("\n" + "="*50)
-    print("FID MATRIX (Rows: Dataset1 Class, Cols: Dataset2 Class)")
-    print("Diagonal elements = Class-wise FID (Same class comparison)")
+    if args.cross_class:
+        print("FID MATRIX (Rows: Dataset1 Class, Cols: Dataset2 Class)")
+        print("Diagonal elements = Class-wise FID (Same class comparison)")
+        print("Off-diagonal elements = Cross-class FID")
+    else:
+        print("CLASS-WISE FID (Diagonal Only)")
+        print("Comparing same class between datasets")
     print("="*50)
     
     # Print Header
     header = "      " + "".join([f"D2_C{j:<6}" for j in range(10)])
     print(header)
     
-    fid_matrix = np.zeros((10, 10))
+    fid_matrix = np.full((10, 10), np.nan)
     
     for i in range(10):
         row_str = f"D1_C{i} "
         for j in range(10):
-            if i in stats1_by_class and j in stats2_by_class:
-                mu1, sig1 = stats1_by_class[i]
-                mu2, sig2 = stats2_by_class[j]
-                
-                fid = calculate_frechet_distance(mu1, sig1, mu2, sig2)
-                fid_matrix[i, j] = fid
-                row_str += f"{fid:>8.2f}"
+            # Only compute if cross_class is True OR if it's a diagonal element (i==j)
+            if args.cross_class or i == j:
+                if i in stats1_by_class and j in stats2_by_class:
+                    mu1, sig1 = stats1_by_class[i]
+                    mu2, sig2 = stats2_by_class[j]
+                    
+                    fid = calculate_frechet_distance(mu1, sig1, mu2, sig2)
+                    fid_matrix[i, j] = fid
+                    row_str += f"{fid:>8.2f}"
+                else:
+                    row_str += "    ----"
             else:
-                row_str += "    ----"
+                # Off-diagonal when cross_class is False
+                row_str += "     N/A"
         print(row_str)
 
     # =========================================================
@@ -230,6 +276,10 @@ def main():
     fid_full = calculate_frechet_distance(mu1_all, sig1_all, mu2_all, sig2_all)
     print(f"FID(D1_All, D2_All): {fid_full:.4f}")
     print("="*50)
+    
+    # Print total execution time
+    total_time = time.time() - start_time
+    print(f"\nTotal execution time: {total_time:.2f}s ({total_time/60:.2f} minutes)")
 
 if __name__ == "__main__":
     main()
