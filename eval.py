@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import inception_v3, Inception_V3_Weights
 import numpy as np
-from scipy import linalg
 import pickle
 import argparse
 import os
@@ -11,116 +10,63 @@ import time
 from tqdm import tqdm
 
 # ==========================================
-# 1. Inception V3 Wrapper (Standard FID)
+# 1. Inception V3 Wrapper
 # ==========================================
 class InceptionV3FeatureExtractor(nn.Module):
     def __init__(self):
         super().__init__()
-        # Load pre-trained InceptionV3
         self.inception = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1)
-        self.inception.fc = nn.Identity() # Remove classification layer
+        self.inception.fc = nn.Identity()
         self.inception.eval()
         
     def forward(self, x):
-        # Resize from 32x32 to 299x299 (Standard FID requirement)
         if x.shape[-1] != 299:
             x = F.interpolate(x, size=(299, 299), mode='bilinear', align_corners=False)
-        
-        # Inception expects input normalized roughly to [-1, 1] or [0, 1] depending on implementation
-        # The standard torch weights expect standardized inputs, but for FID
-        # usually 0-1 range is passed and then normalized internally. 
-        # Here we assume inputs are already [0, 1] tensors.
-        
-        # Get features (mixed_7c output is typically used, but fc identity is 2048 dim)
-        # Using the standard pytorch implementation, .fc identity gives the pooled features.
         x = self.inception(x)
         return x
 
 # ==========================================
-# 2. FID Math Helper
+# 2. PyTorch FID Math Helper (GPU)
 # ==========================================
-def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
-    """
-    Numpy implementation of the Frechet Distance.
-    Uses eigenvalue decomposition for more stable and efficient computation.
-    """
-    mu1 = np.atleast_1d(mu1)
-    mu2 = np.atleast_1d(mu2)
-    
-    sigma1 = np.atleast_2d(sigma1)
-    sigma2 = np.atleast_2d(sigma2)
-
-    assert mu1.shape == mu2.shape, \
-        'Training and test mean vectors have different lengths'
-    assert sigma1.shape == sigma2.shape, \
-        'Training and test covariances have different dimensions'
+def calculate_frechet_distance_torch(mu1, sigma1, mu2, sigma2, eps=1e-6):
+    """PyTorch-native implementation of Frechet Distance."""
+    # Ensure all tensors are on the same device
+    device = mu1.device
+    mu2 = mu2.to(device)
+    sigma1 = sigma1.to(device)
+    sigma2 = sigma2.to(device)
 
     diff = mu1 - mu2
+    mean_term = diff @ diff
 
-    # Compute sqrt of product using eigenvalue decomposition
-    # This is more numerically stable and faster than direct sqrtm
-    # Compute sigma1^(1/2) using eigenvalue decomposition
-    try:
-        # Compute eigenvalues and eigenvectors of sigma1
-        eigvals1, eigvecs1 = np.linalg.eigh(sigma1)
-        # Clip negative eigenvalues to eps for numerical stability
-        eigvals1 = np.maximum(eigvals1, eps)
-        # Compute sigma1^(1/2)
-        sqrt_sigma1 = eigvecs1 @ np.diag(np.sqrt(eigvals1)) @ eigvecs1.T
-        
-        # Compute sqrt(sigma1^(1/2) @ sigma2 @ sigma1^(1/2))
-        product = sqrt_sigma1 @ sigma2 @ sqrt_sigma1
-        
-        # Compute eigenvalues of the product
-        eigvals_prod, eigvecs_prod = np.linalg.eigh(product)
-        # Clip negative eigenvalues
-        eigvals_prod = np.maximum(eigvals_prod, eps)
-        # Sum of square roots of eigenvalues
-        tr_covmean = np.sum(np.sqrt(eigvals_prod))
-        
-    except np.linalg.LinAlgError:
-        print(f"Warning: Eigenvalue decomposition failed, using fallback method")
-        # Fallback to sqrtm if eigenvalue decomposition fails
-        covmean = linalg.sqrtm(sigma1.dot(sigma2))
-        
-        if not np.isfinite(covmean).all():
-            offset = np.eye(sigma1.shape[0]) * eps
-            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
-        
-        if np.iscomplexobj(covmean):
-            if not np.isclose(np.diagonal(covmean).imag, 0, atol=1e-3).all():
-                return np.float64(-1)  # Failure case
-            covmean = covmean.real
-        
-        tr_covmean = np.trace(covmean)
+    eigvals_1, eigvecs_1 = torch.linalg.eigh(sigma1)
+    eigvals_1 = torch.clamp(eigvals_1, min=eps)
+    sqrt_sigma1 = eigvecs_1 @ torch.diag(torch.sqrt(eigvals_1)) @ eigvecs_1.T
 
-    return (diff.dot(diff) + np.trace(sigma1) + 
-            np.trace(sigma2) - 2 * tr_covmean)
+    sigma_prod_sym = sqrt_sigma1 @ sigma2 @ sqrt_sigma1
+    
+    eigvals_prod = torch.linalg.eigvalsh(sigma_prod_sym)
+    eigvals_prod = torch.clamp(eigvals_prod, min=eps)
+    
+    tr_covmean = torch.sum(torch.sqrt(eigvals_prod))
+
+    return mean_term + torch.trace(sigma1) + torch.trace(sigma2) - 2 * tr_covmean
 
 # ==========================================
-# 3. Data Loading
+# 3. Data Loading & Stats Management
 # ==========================================
 def load_cifar_batch_as_tensor(filepath):
-    """
-    Loads a CIFAR-style pickle and returns:
-    - dict: {class_idx: tensor_images_of_that_class}
-    - tensor: all_images
-    """
-    print(f"Loading {filepath}...")
+    """Loads raw CIFAR images from pickle."""
+    print(f"Loading raw images from {filepath}...")
     with open(filepath, 'rb') as f:
         d = pickle.load(f, encoding='bytes')
-        
-    # Extract data
-    data = d[b'data'] # (N, 3072)
+    data = d[b'data']
     labels = np.array(d[b'labels'])
     
-    # Reshape to (N, 3, 32, 32) and normalize to [0, 1]
-    # CIFAR is stored uint8 0-255. Inception needs floats.
-    data = data.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1) # HWC for now
+    data = data.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
     data = data.astype(np.float32) / 255.0
-    data = torch.from_numpy(data).permute(0, 3, 1, 2) # Back to CHW (N, 3, 32, 32)
+    data = torch.from_numpy(data).permute(0, 3, 1, 2)
     
-    # Split by class
     class_dict = {}
     for i in range(10):
         indices = np.where(labels == i)[0]
@@ -129,17 +75,44 @@ def load_cifar_batch_as_tensor(filepath):
             
     return class_dict, data
 
-# ==========================================
-# 4. Feature Extraction & Stats
-# ==========================================
-def get_statistics(images, model, batch_size=50, device='cuda', desc='Processing'):
-    """
-    Computes mu, sigma for a tensor of images.
-    """
+def save_statistics(filepath, stats_full, stats_by_class):
+    """Saves computed stats to .npz file."""
+    flat_dict = {}
+    # Save Full
+    flat_dict['full_mu'] = stats_full[0].cpu().numpy()
+    flat_dict['full_sigma'] = stats_full[1].cpu().numpy()
+    # Save Classes
+    for k, (m, s) in stats_by_class.items():
+        flat_dict[f'class_{k}_mu'] = m.cpu().numpy()
+        flat_dict[f'class_{k}_sigma'] = s.cpu().numpy()
+    
+    np.savez(filepath, **flat_dict)
+    print(f"Saved statistics to {filepath}")
+
+def load_statistics(filepath, device):
+    """Loads stats from .npz file directly to GPU tensors."""
+    print(f"Loading pre-computed stats from {filepath}...")
+    data = np.load(filepath)
+    
+    def to_torch(arr):
+        return torch.from_numpy(arr).to(device)
+
+    stats_full = (to_torch(data['full_mu']), to_torch(data['full_sigma']))
+    
+    stats_by_class = {}
+    for key in data.files:
+        if key.startswith('class_') and key.endswith('_mu'):
+            cls_idx = int(key.split('_')[1])
+            mu = to_torch(data[f'class_{cls_idx}_mu'])
+            sigma = to_torch(data[f'class_{cls_idx}_sigma'])
+            stats_by_class[cls_idx] = (mu, sigma)
+            
+    return stats_by_class, stats_full
+
+def get_statistics_from_images(images, model, batch_size=50, device='cuda', desc='Processing'):
+    """Runs InceptionV3 on images to get stats."""
     model.eval()
     activations = []
-    
-    # Process in batches
     n_samples = len(images)
     n_batches = (n_samples + batch_size - 1) // batch_size
     
@@ -148,106 +121,117 @@ def get_statistics(images, model, batch_size=50, device='cuda', desc='Processing
             start = i * batch_size
             end = min(start + batch_size, n_samples)
             batch = images[start:end].to(device)
-            
-            # Forward
             feat = model(batch)
-            activations.append(feat.cpu().numpy())
+            activations.append(feat) 
             
-    activations = np.concatenate(activations, axis=0) # (N, 2048)
-    
-    print(f"Computing covariance matrix for {n_samples} samples...")
-    mu = np.mean(activations, axis=0)
-    sigma = np.cov(activations, rowvar=False)
-    
+    activations = torch.cat(activations, dim=0)
+    mu = torch.mean(activations, dim=0)
+    sigma = torch.cov(activations.T)
     return mu, sigma
 
 # ==========================================
-# 5. Main Eval Logic
+# 4. Helper: Processing Logic
+# ==========================================
+def process_dataset(filepath, model, batch_size, device):
+    """Decides whether to calculate or load stats based on extension."""
+    if filepath.endswith('.npz'):
+        # Load pre-computed
+        return load_statistics(filepath, device)
+    else:
+        # Calculate from scratch
+        if model is None:
+            raise ValueError("Model is required to process raw images but was not loaded!")
+            
+        class_dict, full_data = load_cifar_batch_as_tensor(filepath)
+        
+        # Stats By Class
+        stats_by_class = {}
+        for i in range(10):
+            if i in class_dict:
+                stats_by_class[i] = get_statistics_from_images(
+                    class_dict[i], model, batch_size, device, desc=f"Class {i}"
+                )
+        # Stats Full
+        stats_full = get_statistics_from_images(
+            full_data, model, batch_size, device, desc="Full Dataset"
+        )
+        return stats_by_class, stats_full
+
+# ==========================================
+# 5. Main
 # ==========================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset1", type=str, required=True, help="Path to reference pickle (e.g., original test_batch)")
-    parser.add_argument("--dataset2", type=str, required=True, help="Path to generated pickle")
-    parser.add_argument("--batch_size", type=int, default=50)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--cross_class", action="store_true", help="Calculate cross-class FID (off-diagonal elements)")
+    # Mode switch
+    parser.add_argument("--compute_stats_only", action="store_true", help="Only compute and save stats for dataset1")
+    parser.add_argument("--save_to", type=str, default=None, help="Path to save .npz file (used with --compute_stats_only)")
+    
+    # Standard Eval Args
+    parser.add_argument("--dataset1", type=str, required=True, help="Reference or Gen")
+    parser.add_argument("--dataset2", type=str, default=None, help="Required unless compute_stats_only is set")
+    parser.add_argument("--batch_size", type=int, default=100)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--cross_class", action="store_true")
     args = parser.parse_args()
     
-    start_time = time.time()
-    
-    # 1. Load Model
-    print("Loading InceptionV3...")
-    t0 = time.time()
-    model = InceptionV3FeatureExtractor().to(args.device)
-    print(f"  Model loaded in {time.time() - t0:.2f}s")
-    
-    # 2. Load Datasets
-    # Returns dict {0: tensor, 1: tensor...} and full tensor
-    t0 = time.time()
-    d1_classes, d1_full = load_cifar_batch_as_tensor(args.dataset1)
-    d2_classes, d2_full = load_cifar_batch_as_tensor(args.dataset2)
-    print(f"  Datasets loaded in {time.time() - t0:.2f}s")
-    
-    # 3. Pre-compute Statistics (Optimization)
-    # We calculate Mu/Sigma ONCE for every subset to avoid re-running the model
-    print("\n--- Computing Statistics for Dataset 1 ---")
-    t0 = time.time()
-    stats1_by_class = {}
-    for i in tqdm(range(10), desc="Classes D1"):
-        if i in d1_classes:
-            stats1_by_class[i] = get_statistics(d1_classes[i], model, args.batch_size, args.device, desc=f"D1 Class {i}")
-    
-    print("Computing stats for D1 Full...")
-    stats1_full = get_statistics(d1_full, model, args.batch_size, args.device, desc="D1 Full Dataset")
-    print(f"  D1 statistics computed in {time.time() - t0:.2f}s")
+    # 1. Lazy Load Model
+    # We only need the model if at least one input is NOT a .npz file
+    needs_model = not (str(args.dataset1).endswith('.npz'))
+    if args.dataset2 and not str(args.dataset2).endswith('.npz'):
+        needs_model = True
+        
+    model = None
+    if needs_model:
+        print("Loading InceptionV3 (Model needed for raw images)...")
+        model = InceptionV3FeatureExtractor().to(args.device)
+    else:
+        print("Skipping Model Load (Using pre-computed stats)...")
 
-    print("\n--- Computing Statistics for Dataset 2 ---")
-    t0 = time.time()
-    stats2_by_class = {}
-    for i in tqdm(range(10), desc="Classes D2"):
-        if i in d2_classes:
-            stats2_by_class[i] = get_statistics(d2_classes[i], model, args.batch_size, args.device, desc=f"D2 Class {i}")
+    # 2. Mode: Compute Stats Only
+    if args.compute_stats_only:
+        if not args.save_to:
+            print("Error: --save_to is required for compute_stats_only mode")
+            return
+        
+        print(f"--- Pre-computing statistics for {args.dataset1} ---")
+        stats_class, stats_full = process_dataset(args.dataset1, model, args.batch_size, args.device)
+        save_statistics(args.save_to, stats_full, stats_class)
+        return
 
-    print("Computing stats for D2 Full...")
-    stats2_full = get_statistics(d2_full, model, args.batch_size, args.device, desc="D2 Full Dataset")
-    print(f"  D2 statistics computed in {time.time() - t0:.2f}s")
+    # 3. Mode: Evaluation
+    if not args.dataset2:
+        print("Error: --dataset2 is required for evaluation mode")
+        return
+
+    # Load D1
+    print(f"\n--- Processing Dataset 1: {args.dataset1} ---")
+    stats1_by_class, stats1_full = process_dataset(args.dataset1, model, args.batch_size, args.device)
+
+    # Load D2
+    print(f"\n--- Processing Dataset 2: {args.dataset2} ---")
+    stats2_by_class, stats2_full = process_dataset(args.dataset2, model, args.batch_size, args.device)
 
     # =========================================================
-    # Task 1 & 2: Class-Wise and Cross-Class Matrix
+    # Task 1 & 2: D1 vs D2 Matrix
     # =========================================================
     print("\n" + "="*50)
-    if args.cross_class:
-        print("FID MATRIX (Rows: Dataset1 Class, Cols: Dataset2 Class)")
-        print("Diagonal elements = Class-wise FID (Same class comparison)")
-        print("Off-diagonal elements = Cross-class FID")
-    else:
-        print("CLASS-WISE FID (Diagonal Only)")
-        print("Comparing same class between datasets")
+    print("TASK 1 & 2: Dataset 1 (Rows) vs Dataset 2 (Cols)")
     print("="*50)
-    
-    # Print Header
-    header = "      " + "".join([f"D2_C{j:<6}" for j in range(10)])
-    print(header)
-    
-    fid_matrix = np.full((10, 10), np.nan)
+    print("      " + "".join([f"D2_C{j:<6}" for j in range(10)]))
     
     for i in range(10):
         row_str = f"D1_C{i} "
         for j in range(10):
-            # Only compute if cross_class is True OR if it's a diagonal element (i==j)
             if args.cross_class or i == j:
                 if i in stats1_by_class and j in stats2_by_class:
                     mu1, sig1 = stats1_by_class[i]
                     mu2, sig2 = stats2_by_class[j]
-                    
-                    fid = calculate_frechet_distance(mu1, sig1, mu2, sig2)
-                    fid_matrix[i, j] = fid
-                    row_str += f"{fid:>8.2f}"
+                    fid = calculate_frechet_distance_torch(mu1, sig1, mu2, sig2)
+                    row_str += f"{fid.item():>8.2f}"
                 else:
                     row_str += "    ----"
             else:
-                # Off-diagonal when cross_class is False
-                row_str += "     N/A"
+                row_str += "     ..."
         print(row_str)
 
     # =========================================================
@@ -262,8 +246,23 @@ def main():
     for i in range(10):
         if i in stats1_by_class:
             mu1, sig1 = stats1_by_class[i]
-            fid = calculate_frechet_distance(mu1, sig1, mu2_all, sig2_all)
-            print(f"Class {i} vs D2_All: {fid:.4f}")
+            fid = calculate_frechet_distance_torch(mu1, sig1, mu2_all, sig2_all)
+            print(f"Class {i} vs D2_All: {fid.item():.4f}")
+
+    # =========================================================
+    # Task 3b: Unconditional vs Class-Specific (D1_All vs D2_Class)
+    # =========================================================
+    print("\n" + "="*50)
+    print("Task 3b: Unconditional vs Class-Specific (FID(D1_All, D2_Class_i))")
+    print("Measures how well each D2 class resembles the entire distribution of D1")
+    print("="*50)
+    
+    mu1_all, sig1_all = stats1_full
+    for i in range(10):
+        if i in stats2_by_class:
+            mu2, sig2 = stats2_by_class[i]
+            fid = calculate_frechet_distance_torch(mu1_all, sig1_all, mu2, sig2)
+            print(f"D1_All vs Class {i}: {fid.item():.4f}")
 
     # =========================================================
     # Task 4: Unconditional vs Unconditional
@@ -273,13 +272,64 @@ def main():
     print("="*50)
     
     mu1_all, sig1_all = stats1_full
-    fid_full = calculate_frechet_distance(mu1_all, sig1_all, mu2_all, sig2_all)
-    print(f"FID(D1_All, D2_All): {fid_full:.4f}")
+    fid_full = calculate_frechet_distance_torch(mu1_all, sig1_all, mu2_all, sig2_all)
+    print(f"FID(D1_All, D2_All): {fid_full.item():.4f}")
+    print("="*50)
+
+    # =========================================================
+    # Task 5: Internal Generated Diversity (D2 Class vs D2 Class)
+    # =========================================================
+    print("\n" + "="*50)
+    print("Task 5: Internal Separability (D2 Class i vs D2 Class j)")
+    print("Measures if Dataset2 Class 0 looks distinct from Dataset2 Class 1")
+    print("Diagonal is always 0. High off-diagonal = Good separation.")
     print("="*50)
     
-    # Print total execution time
-    total_time = time.time() - start_time
-    print(f"\nTotal execution time: {total_time:.2f}s ({total_time/60:.2f} minutes)")
+    print("      " + "".join([f"D2_C{j:<6}" for j in range(10)]))
+    
+    for i in range(10):
+        row_str = f"D2_C{i} "
+        for j in range(10):
+            if i in stats2_by_class and j in stats2_by_class:
+                if i == j:
+                    row_str += f"{0.0:>8.1f}" # Identity
+                else:
+                    mu_i, sig_i = stats2_by_class[i]
+                    mu_j, sig_j = stats2_by_class[j]
+                    fid = calculate_frechet_distance_torch(mu_i, sig_i, mu_j, sig_j)
+                    row_str += f"{fid.item():>8.1f}"
+            else:
+                row_str += "    ----"
+        print(row_str)
 
+    # =========================================================
+    # Task 6: Intra-Class Diversity (Trace of Covariance)
+    # =========================================================
+    print("\n" + "="*65)
+    print("Task 6: Intra-Class Diversity (Total Variance)")
+    print("Measures the 'width' of the distribution in feature space.")
+    print("Low Gen Trace (< 1.0)  = Mode Collapse (Zero Diversity)")
+    print("High Gen Trace (~Real) = Good Diversity")
+    print("="*65)
+    
+    print(f"{'Class':<6} | {'Real Trace':<12} | {'Gen Trace':<12} | {'Ratio (Gen/Real)':<15}")
+    print("-" * 55)
+    
+    for i in range(10):
+        # We need both stats to be present
+        if i in stats1_by_class and i in stats2_by_class:
+            _, sig1 = stats1_by_class[i] # Real Sigma
+            _, sig2 = stats2_by_class[i] # Gen Sigma
+            
+            # Calculate Trace (Sum of variances)
+            tr1 = torch.trace(sig1).item()
+            tr2 = torch.trace(sig2).item()
+            
+            # Ratio of 1.0 means perfect diversity match
+            ratio = tr2 / (tr1 + 1e-8)
+            
+            print(f"{i:<6} | {tr1:>12.2f} | {tr2:>12.2f} | {ratio:>15.2f}")
+
+    print("="*65)
 if __name__ == "__main__":
     main()
